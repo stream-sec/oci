@@ -1,10 +1,9 @@
 # Stream Security OCI integration — Resource Manager stack.
-# Creates a read-only API user/group/policy in your tenancy so Stream Security
-# can inventory and posture-check resources via the OCI APIs.
 #
-# This module is intentionally minimal. It runs in OCI Resource Manager which
-# auto-injects credentials via its own service principal — no auth field is
-# needed on the provider block.
+# Creates a read-only API user, group, and IAM policy in your tenancy and
+# generates a fresh RSA API key for that user. The user OCID, key fingerprint,
+# and private key are exposed as stack outputs so you can paste them back into
+# the Stream Security onboarding wizard.
 
 terraform {
   required_version = ">= 1.3"
@@ -13,11 +12,14 @@ terraform {
       source  = "oracle/oci"
       version = ">= 5.0.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = ">= 4.0.0"
+    }
   }
 }
 
-# tenancy_ocid + current_user_ocid + region are auto-populated by Resource
-# Manager when the stack is launched via the "Deploy to Oracle Cloud" button.
+# Auto-populated by Resource Manager from the launching user's session.
 variable "tenancy_ocid" {
   type        = string
   description = "Tenancy OCID (auto-populated by Resource Manager)."
@@ -33,17 +35,16 @@ variable "region" {
   description = "OCI region (auto-populated by Resource Manager)."
 }
 
-# external_id + account_token come from the Stream Security wizard via
-# zipUrlVariables when the magic launch URL is built.
+# Passed by the Stream Security wizard via zipUrlVariables.
 variable "external_id" {
   type        = string
-  description = "Stream Security account identifier — passed via zipUrlVariables."
+  description = "Stream Security account identifier."
 }
 
 variable "account_token" {
   type        = string
   sensitive   = true
-  description = "Stream Security per-account token — passed via zipUrlVariables."
+  description = "Stream Security per-account token (echoed in outputs for the wizard)."
 }
 
 provider "oci" {
@@ -53,7 +54,7 @@ provider "oci" {
 resource "oci_identity_group" "stream_security_readers" {
   compartment_id = var.tenancy_ocid
   name           = "stream-security-readers-${var.external_id}"
-  description    = "Group granting Stream Security read access to this tenancy."
+  description    = "Stream Security read access."
 }
 
 resource "oci_identity_user" "stream_security_api_user" {
@@ -79,13 +80,37 @@ resource "oci_identity_policy" "stream_security_read_policy" {
   ]
 }
 
+# Generate a fresh RSA keypair and upload the public half as the user's API key.
+# Private key is exposed as a sensitive output so the customer can paste it
+# back into the Stream Security wizard.
+resource "tls_private_key" "stream_security_key" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "oci_identity_api_key" "stream_security_api_key" {
+  user_id   = oci_identity_user.stream_security_api_user.id
+  key_value = tls_private_key.stream_security_key.public_key_pem
+}
+
 output "stream_security_user_ocid" {
   value       = oci_identity_user.stream_security_api_user.id
-  description = "Paste this user OCID back into the Stream Security wizard."
+  description = "User OCID — paste into the Stream Security wizard."
+}
+
+output "stream_security_fingerprint" {
+  value       = oci_identity_api_key.stream_security_api_key.fingerprint
+  description = "API key fingerprint — paste into the Stream Security wizard."
+}
+
+output "stream_security_private_key" {
+  value       = tls_private_key.stream_security_key.private_key_pem
+  sensitive   = true
+  description = "API private key (PEM) — paste into the Stream Security wizard. Sensitive."
 }
 
 output "stream_security_account_token" {
   value       = var.account_token
   sensitive   = true
-  description = "Per-account token (passed in via zipUrlVariables; echoed here for convenience)."
+  description = "Stream Security account token (echoed for convenience)."
 }
