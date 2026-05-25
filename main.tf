@@ -1,4 +1,4 @@
-# Stream Security OCI integration - Resource Manager stack v1.1.3
+# Stream Security OCI integration - Resource Manager stack v1.1.4
 #
 # Auto-ack via direct HTTP POST from the stack (terraform_data + local-exec).
 # Earlier versions tried OCI Events + Notifications, but the events rule
@@ -8,8 +8,13 @@
 # entirely — terraform_data runs after the api_key exists, curls the
 # fingerprint + user OCID straight to Stream Security's endpoint.
 #
-# Side benefit: customer's tenancy stays much cleaner (no ONS topic,
-# subscription, or Events rule).
+# v1.1.4 additionally posts tenancy_ocid (RM auto-injects var.tenancy_ocid
+# from the launching session). This lets Stream Security skip the OCI
+# Identity API roundtrip for credential validation and avoids pulling in
+# the heavy Oracle SDK on the SaaS side.
+#
+# Customer's tenancy stays clean: user/group/policy/api_key only — no ONS
+# topic, subscription, or Events rule.
 
 terraform {
   required_version = ">= 1.4"
@@ -120,7 +125,7 @@ resource "terraform_data" "stream_security_ack" {
     command = <<-EOT
       curl -sS -f -X POST \
         -H 'Content-Type: application/json' \
-        --data '{"user_ocid":"${oci_identity_user.stream_security_api_user.id}","fingerprint":"${oci_identity_api_key.stream_security_api_key.fingerprint}"}' \
+        --data '{"user_ocid":"${oci_identity_user.stream_security_api_user.id}","fingerprint":"${oci_identity_api_key.stream_security_api_key.fingerprint}","tenancy_ocid":"${var.tenancy_ocid}"}' \
         '${var.acknowledge_url}'
     EOT
   }
