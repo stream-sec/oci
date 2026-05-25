@@ -1,25 +1,30 @@
-# Stream Security OCI integration - Resource Manager stack v1.2.0
+# Stream Security OCI integration - Resource Manager stack v1.3.0
 #
 # Onboarding ack: terraform_data + local-exec POST to acknowledge_url
-# (unchanged from v1.1.4 — direct HTTP, no Events service involved, no
-# propagation race because it's a one-shot).
+# (unchanged from v1.1.4).
 #
-# v1.2.0 adds the ongoing audit-event pipeline:
-#   ONS topic stream-security-events
-#     <- ONS HTTPS subscription -> Stream Security events_url
-#   Events rule stream-security-audit-events forwards
-#     com.oraclecloud.{computeapi|virtualnetwork|identitycontrolplane}.*
-#   into that topic.
+# v1.2.0 added the ongoing audit-event pipeline (Events rule → ONS topic
+# → HTTPS subscription → events_url). v1.3.0 adds VCN Flow Logs.
 #
-# Race note: the propagation lag that bit v1.1.2 was specific to the
-# one-shot ack (rule + api_key created in the same apply). For ONGOING
-# events the rule is long-lived — by the time customers create/modify
-# real resources, propagation has had hours/days, so events land
-# reliably.
+# v1.3.0 flow logs pipeline:
+#   OCI Logging log group "stream-security-logs"
+#     contains per-subnet VCN_FLOW_LOG entries
+#   OCI Service Connector "stream-security-flow-logs-connector"
+#     source = Logging (the log group), target = ONS topic
+#   ONS topic stream-security-flow-logs
+#     <- ONS HTTPS subscription -> Stream Security flow_logs_url
+#
+# Note on scale: ONS HTTPS subscriptions have a ~60 msg/sec per-topic
+# limit. Sufficient for small-to-mid customers. For high-volume
+# tenancies use OCI Streaming as the Service Connector target and run
+# a Lightlytics consumer against the Streaming stream — separate
+# follow-up tracked in CTO-061 HLD.
 #
 # Customer's tenancy footprint:
 #   user, group, membership, policy, api_key (onboarding)
 #   ons_topic, ons_subscription, events_rule (ongoing events)
+#   log_group, vcn_flow_log per subnet, sch_service_connector,
+#     flow_logs_ons_topic, flow_logs_ons_subscription (flow logs)
 
 terraform {
   required_version = ">= 1.4"
@@ -72,6 +77,11 @@ variable "acknowledge_url" {
 variable "events_url" {
   type        = string
   description = "Stream Security audit-event webhook HTTPS endpoint (with account_token in path)."
+}
+
+variable "flow_logs_url" {
+  type        = string
+  description = "Stream Security VCN flow-log webhook HTTPS endpoint (with account_token in path)."
 }
 
 provider "oci" {
@@ -225,4 +235,77 @@ resource "oci_events_rule" "stream_security_audit_events" {
       topic_id    = oci_ons_notification_topic.stream_security_events_topic.id
     }
   }
+}
+
+# ---------------------------------------------------------------------------
+# VCN flow logs pipeline (v1.3.0+).
+# Log group → VCN flow log per subnet → Service Connector → ONS topic →
+# HTTPS subscription → Stream Security webhook.
+# ---------------------------------------------------------------------------
+
+resource "oci_logging_log_group" "stream_security_logs" {
+  compartment_id = var.tenancy_ocid
+  display_name   = "stream-security-logs-${var.external_id}"
+  description    = "Log group for Stream Security flow log collection."
+}
+
+# One VCN flow log per subnet. Caller's tenancy may have many subnets;
+# we enable flow logging on the ones our subnet scan already discovered.
+# For Phase 1 we cover the customer's existing subnets at stack-apply
+# time — newly-created subnets won't be auto-flow-logged. (Real-time
+# inventory events will tell us when a new subnet exists; the customer
+# can re-apply the stack to add flow logging on it.)
+data "oci_core_subnets" "all" {
+  compartment_id = var.tenancy_ocid
+}
+
+resource "oci_logging_log" "stream_security_vcn_flow_log" {
+  for_each     = { for s in data.oci_core_subnets.all.subnets : s.id => s }
+  log_group_id = oci_logging_log_group.stream_security_logs.id
+  display_name = "stream-security-flowlog-${each.value.display_name}"
+  log_type     = "SERVICE"
+  is_enabled   = true
+  configuration {
+    source {
+      category    = "all"
+      resource    = each.key
+      service     = "flowlogs"
+      source_type = "OCISERVICE"
+    }
+    compartment_id = each.value.compartment_id
+  }
+}
+
+resource "oci_ons_notification_topic" "stream_security_flow_logs_topic" {
+  compartment_id = var.tenancy_ocid
+  name           = "stream-security-flow-logs-${var.external_id}"
+  description    = "Stream Security VCN flow log delivery topic."
+}
+
+resource "oci_ons_subscription" "stream_security_flow_logs" {
+  compartment_id = var.tenancy_ocid
+  topic_id       = oci_ons_notification_topic.stream_security_flow_logs_topic.id
+  protocol       = "CUSTOM_HTTPS"
+  endpoint       = var.flow_logs_url
+}
+
+resource "oci_sch_service_connector" "stream_security_flow_logs_connector" {
+  compartment_id = var.tenancy_ocid
+  display_name   = "stream-security-flow-logs-${var.external_id}"
+  description    = "Stream Security: route VCN flow logs to Notifications."
+  source {
+    kind = "logging"
+    log_sources {
+      compartment_id = var.tenancy_ocid
+      log_group_id   = oci_logging_log_group.stream_security_logs.id
+    }
+  }
+  target {
+    kind     = "notifications"
+    topic_id = oci_ons_notification_topic.stream_security_flow_logs_topic.id
+  }
+  depends_on = [
+    oci_logging_log.stream_security_vcn_flow_log,
+    oci_ons_subscription.stream_security_flow_logs,
+  ]
 }
