@@ -1,20 +1,25 @@
-# Stream Security OCI integration - Resource Manager stack v1.1.4
+# Stream Security OCI integration - Resource Manager stack v1.2.0
 #
-# Auto-ack via direct HTTP POST from the stack (terraform_data + local-exec).
-# Earlier versions tried OCI Events + Notifications, but the events rule
-# created in the same apply as the api_key wasn't yet propagated in the
-# Events backend when the CreateApiKey audit event fired (~375 ms later),
-# so the event was emitted but never matched. v1.1.3 bypasses Events
-# entirely — terraform_data runs after the api_key exists, curls the
-# fingerprint + user OCID straight to Stream Security's endpoint.
+# Onboarding ack: terraform_data + local-exec POST to acknowledge_url
+# (unchanged from v1.1.4 — direct HTTP, no Events service involved, no
+# propagation race because it's a one-shot).
 #
-# v1.1.4 additionally posts tenancy_ocid (RM auto-injects var.tenancy_ocid
-# from the launching session). This lets Stream Security skip the OCI
-# Identity API roundtrip for credential validation and avoids pulling in
-# the heavy Oracle SDK on the SaaS side.
+# v1.2.0 adds the ongoing audit-event pipeline:
+#   ONS topic stream-security-events
+#     <- ONS HTTPS subscription -> Stream Security events_url
+#   Events rule stream-security-audit-events forwards
+#     com.oraclecloud.{computeapi|virtualnetwork|identitycontrolplane}.*
+#   into that topic.
 #
-# Customer's tenancy stays clean: user/group/policy/api_key only — no ONS
-# topic, subscription, or Events rule.
+# Race note: the propagation lag that bit v1.1.2 was specific to the
+# one-shot ack (rule + api_key created in the same apply). For ONGOING
+# events the rule is long-lived — by the time customers create/modify
+# real resources, propagation has had hours/days, so events land
+# reliably.
+#
+# Customer's tenancy footprint:
+#   user, group, membership, policy, api_key (onboarding)
+#   ons_topic, ons_subscription, events_rule (ongoing events)
 
 terraform {
   required_version = ">= 1.4"
@@ -62,6 +67,11 @@ variable "public_key" {
 variable "acknowledge_url" {
   type        = string
   description = "Stream Security auto-ack HTTPS endpoint (with account_token in path)."
+}
+
+variable "events_url" {
+  type        = string
+  description = "Stream Security audit-event webhook HTTPS endpoint (with account_token in path)."
 }
 
 provider "oci" {
@@ -148,4 +158,71 @@ output "stream_security_fingerprint" {
 output "stream_security_status" {
   value       = "API key uploaded and acknowledgement POSTed to Stream Security. Status should flip to PENDING within ~1 minute."
   description = "Status hint for the customer."
+}
+
+# ---------------------------------------------------------------------------
+# Ongoing audit-event pipeline (v1.2.0+).
+# Events rule -> ONS topic -> HTTPS subscription -> Stream Security webhook.
+# ---------------------------------------------------------------------------
+
+resource "oci_ons_notification_topic" "stream_security_events_topic" {
+  compartment_id = var.tenancy_ocid
+  name           = "stream-security-events-${var.external_id}"
+  description    = "Stream Security ongoing audit-event delivery topic."
+}
+
+resource "oci_ons_subscription" "stream_security_events" {
+  compartment_id = var.tenancy_ocid
+  topic_id       = oci_ons_notification_topic.stream_security_events_topic.id
+  protocol       = "CUSTOM_HTTPS"
+  endpoint       = var.events_url
+}
+
+# Match every audit event from the three OCI services that cover our 6 MVP
+# resource types. Filtering down to specific event types happens inside
+# Stream Security via the per-resource change_track_keys map — keeping the
+# rule broad means future resource-type additions don't require a customer-
+# side stack update.
+resource "oci_events_rule" "stream_security_audit_events" {
+  compartment_id = var.tenancy_ocid
+  display_name   = "stream-security-audit-events-${var.external_id}"
+  description    = "Forward OCI Compute/Network/Identity audit events to Stream Security."
+  is_enabled     = true
+  condition = jsonencode({
+    eventType = [
+      # Compute lifecycle (oci_instance)
+      "com.oraclecloud.computeapi.launchinstance",
+      "com.oraclecloud.computeapi.terminateinstance",
+      "com.oraclecloud.computeapi.updateinstance",
+      "com.oraclecloud.computeapi.instanceaction",
+      # Virtual Network (oci_vcn, oci_subnet)
+      "com.oraclecloud.virtualnetwork.createvcn",
+      "com.oraclecloud.virtualnetwork.deletevcn",
+      "com.oraclecloud.virtualnetwork.updatevcn",
+      "com.oraclecloud.virtualnetwork.createsubnet",
+      "com.oraclecloud.virtualnetwork.deletesubnet",
+      "com.oraclecloud.virtualnetwork.updatesubnet",
+      "com.oraclecloud.virtualnetwork.changesubnetcompartment",
+      # Identity (oci_user, oci_policy, oci_compartment)
+      "com.oraclecloud.identitycontrolplane.createuser",
+      "com.oraclecloud.identitycontrolplane.deleteuser",
+      "com.oraclecloud.identitycontrolplane.updateuser",
+      "com.oraclecloud.identitycontrolplane.updateuserstate",
+      "com.oraclecloud.identitycontrolplane.updateusercapabilities",
+      "com.oraclecloud.identitycontrolplane.createpolicy",
+      "com.oraclecloud.identitycontrolplane.deletepolicy",
+      "com.oraclecloud.identitycontrolplane.updatepolicy",
+      "com.oraclecloud.identitycontrolplane.createcompartment",
+      "com.oraclecloud.identitycontrolplane.deletecompartment",
+      "com.oraclecloud.identitycontrolplane.updatecompartment",
+      "com.oraclecloud.identitycontrolplane.movecompartment",
+    ]
+  })
+  actions {
+    actions {
+      action_type = "ONS"
+      is_enabled  = true
+      topic_id    = oci_ons_notification_topic.stream_security_events_topic.id
+    }
+  }
 }
