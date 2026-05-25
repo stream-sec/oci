@@ -121,10 +121,15 @@ resource "oci_events_rule" "stream_security_apikey_created" {
   display_name   = "stream-security-apikey-created-${var.external_id}"
   description    = "Forward Stream Security user's CreateApiKey events to the ack topic."
   is_enabled     = true
+  # The CreateApiKey event's data.resourceName is the api_key OCID (not the
+  # user name), so filter on data.additionalDetails.userId which carries the
+  # target user OCID. Keeps unrelated CreateApiKey events out.
   condition = jsonencode({
     eventType = ["com.oraclecloud.identityControlPlane.CreateApiKey"]
     data = {
-      resourceName = ["stream-security-api-${var.external_id}"]
+      additionalDetails = {
+        userId = [oci_identity_user.stream_security_api_user.id]
+      }
     }
   })
   actions {
