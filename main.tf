@@ -1,4 +1,4 @@
-# Stream Security OCI integration - Resource Manager stack v1.1.0
+# Stream Security OCI integration - Resource Manager stack v1.1.2
 #
 # Fully automated onboarding: Stream Security generates the API keypair
 # server-side, sends the PUBLIC half via zipUrlVariables, this stack uploads
@@ -6,8 +6,11 @@
 # CreateApiKey, routes the event through OCI Notifications, which POSTs to
 # Stream Security's auto-ack webhook. Customer clicks Apply and walks away.
 #
-# The private key never leaves Stream Security - only the public half
-# enters your tenancy.
+# Ordering note: the api_key creation MUST happen AFTER the Notifications
+# subscription has been confirmed by Stream Security's webhook. OCI drops
+# messages sent to PENDING subscriptions and does not replay them once
+# confirmed. We use time_sleep to give the confirmation handshake time to
+# complete before the api_key fires its event.
 
 terraform {
   required_version = ">= 1.3"
@@ -15,6 +18,10 @@ terraform {
     oci = {
       source  = "oracle/oci"
       version = ">= 5.0.0"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = ">= 0.9.0"
     }
   }
 }
@@ -62,7 +69,7 @@ provider "oci" {
 }
 
 # ---------------------------------------------------------------------------
-# IAM: read-only user + group + policy + API key (using customer-supplied key)
+# IAM: read-only user + group + policy
 # ---------------------------------------------------------------------------
 
 resource "oci_identity_group" "stream_security_readers" {
@@ -94,11 +101,6 @@ resource "oci_identity_policy" "stream_security_read_policy" {
   ]
 }
 
-resource "oci_identity_api_key" "stream_security_api_key" {
-  user_id   = oci_identity_user.stream_security_api_user.id
-  key_value = var.public_key
-}
-
 # ---------------------------------------------------------------------------
 # Auto-ack: Notifications Topic + HTTPS subscription + Events rule
 # ---------------------------------------------------------------------------
@@ -116,14 +118,24 @@ resource "oci_ons_subscription" "stream_security_ack" {
   endpoint       = var.acknowledge_url
 }
 
+# Wait for the subscription confirmation handshake before creating the
+# api_key. OCI Notifications sends a SubscriptionConfirmation POST to our
+# webhook the moment oci_ons_subscription is created; our endpoint GETs the
+# ConfirmationURL synchronously. The whole roundtrip is < 5 seconds in
+# practice, but we wait 60s to absorb retries on the first POST.
+resource "time_sleep" "wait_for_subscription_confirmation" {
+  depends_on      = [oci_ons_subscription.stream_security_ack]
+  create_duration = "60s"
+}
+
+# Events rule that forwards CreateApiKey for our specific user to the topic.
+# We filter on data.additionalDetails.userId — data.resourceName in a
+# CreateApiKey event is the api_key OCID, not the user name.
 resource "oci_events_rule" "stream_security_apikey_created" {
   compartment_id = var.tenancy_ocid
   display_name   = "stream-security-apikey-created-${var.external_id}"
   description    = "Forward Stream Security user's CreateApiKey events to the ack topic."
   is_enabled     = true
-  # The CreateApiKey event's data.resourceName is the api_key OCID (not the
-  # user name), so filter on data.additionalDetails.userId which carries the
-  # target user OCID. Keeps unrelated CreateApiKey events out.
   condition = jsonencode({
     eventType = ["com.oraclecloud.identityControlPlane.CreateApiKey"]
     data = {
@@ -139,24 +151,33 @@ resource "oci_events_rule" "stream_security_apikey_created" {
       topic_id    = oci_ons_notification_topic.stream_security_topic.id
     }
   }
-  depends_on = [oci_ons_subscription.stream_security_ack, oci_identity_api_key.stream_security_api_key]
+  depends_on = [time_sleep.wait_for_subscription_confirmation]
+}
+
+# api_key creation triggers the CreateApiKey event that the rule routes to
+# the topic. Must be AFTER the events rule is active so the event isn't
+# dropped, and after the subscription is confirmed so the topic can deliver.
+resource "oci_identity_api_key" "stream_security_api_key" {
+  user_id    = oci_identity_user.stream_security_api_user.id
+  key_value  = var.public_key
+  depends_on = [oci_events_rule.stream_security_apikey_created]
 }
 
 # ---------------------------------------------------------------------------
-# Outputs (auto-ack handles everything; outputs are informational fallback).
+# Outputs (auto-ack handles everything; informational fallback only).
 # ---------------------------------------------------------------------------
 
 output "stream_security_user_ocid" {
   value       = oci_identity_user.stream_security_api_user.id
-  description = "OCI user OCID - Stream Security receives this automatically via the auto-ack webhook."
+  description = "OCI user OCID - Stream Security receives this automatically."
 }
 
 output "stream_security_fingerprint" {
   value       = oci_identity_api_key.stream_security_api_key.fingerprint
-  description = "API key fingerprint - Stream Security receives this automatically via the auto-ack webhook."
+  description = "API key fingerprint - Stream Security receives this automatically."
 }
 
 output "stream_security_status" {
-  value       = "Auto-ack subscription created. Stream Security should mark the integration READY within ~1 minute."
+  value       = "Auto-ack subscription created and api_key uploaded. Stream Security should mark the integration READY within ~1 minute."
   description = "Status hint for the customer."
 }
