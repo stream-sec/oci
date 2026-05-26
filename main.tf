@@ -1,4 +1,4 @@
-# Stream Security OCI integration - Resource Manager stack v1.4.0
+# Stream Security OCI integration - Resource Manager stack v1.5.0
 #
 # Onboarding ack: terraform_data + local-exec POST to acknowledge_url
 # (unchanged from v1.1.4).
@@ -35,6 +35,10 @@ terraform {
     oci = {
       source  = "oracle/oci"
       version = ">= 5.0.0"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = ">= 0.9.0"
     }
   }
 }
@@ -140,10 +144,27 @@ resource "oci_identity_api_key" "stream_security_api_key" {
 # Auto-ack: direct HTTP POST to Stream Security with user_ocid + fingerprint.
 # ---------------------------------------------------------------------------
 
+# Wait for OCI IAM to propagate the api_key + group membership + policy
+# before signaling Stream Security to scan. Without this delay, the first
+# scan races IAM and gets 401 NotAuthenticated on every SDK call — visible
+# as an empty inventory on first onboarding. OCI's documented propagation
+# window for new IAM principals is up to 60 seconds (see
+# https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/policies.htm
+# #consistency).
+resource "time_sleep" "wait_for_iam_propagation" {
+  depends_on = [
+    oci_identity_api_key.stream_security_api_key,
+    oci_identity_user_group_membership.stream_security_membership,
+    oci_identity_policy.stream_security_read_policy,
+  ]
+  create_duration = "90s"
+}
+
 # triggers_replace fires only when the fingerprint changes, so re-running
 # `terraform apply` later (or on plan refresh) doesn't keep re-posting.
 resource "terraform_data" "stream_security_ack" {
   triggers_replace = [oci_identity_api_key.stream_security_api_key.fingerprint]
+  depends_on       = [time_sleep.wait_for_iam_propagation]
   provisioner "local-exec" {
     command = <<-EOT
       curl -sS -f -X POST \
@@ -249,6 +270,31 @@ resource "oci_events_rule" "stream_security_audit_events" {
       "com.oraclecloud.objectstorage.createbucket",
       "com.oraclecloud.objectstorage.deletebucket",
       "com.oraclecloud.objectstorage.updatebucket",
+      # Phase 2 batch B: Internet Gateway / NAT Gateway / Route Table / Security List
+      "com.oraclecloud.virtualnetwork.createinternetgateway",
+      "com.oraclecloud.virtualnetwork.deleteinternetgateway",
+      "com.oraclecloud.virtualnetwork.updateinternetgateway",
+      "com.oraclecloud.virtualnetwork.createnatgateway",
+      "com.oraclecloud.virtualnetwork.deletenatgateway",
+      "com.oraclecloud.virtualnetwork.updatenatgateway",
+      "com.oraclecloud.virtualnetwork.createroutetable",
+      "com.oraclecloud.virtualnetwork.deleteroutetable",
+      "com.oraclecloud.virtualnetwork.updateroutetable",
+      "com.oraclecloud.virtualnetwork.createsecuritylist",
+      "com.oraclecloud.virtualnetwork.deletesecuritylist",
+      "com.oraclecloud.virtualnetwork.updatesecuritylist",
+      # Phase 2 batch B: DB System
+      "com.oraclecloud.databaseservice.launchdbsystem",
+      "com.oraclecloud.databaseservice.terminatedbsystem",
+      "com.oraclecloud.databaseservice.updatedbsystem",
+      # Phase 2 batch B: Functions Application
+      "com.oraclecloud.functions.createapplication",
+      "com.oraclecloud.functions.deleteapplication",
+      "com.oraclecloud.functions.updateapplication",
+      # Phase 2 batch B: API Gateway
+      "com.oraclecloud.apigateway.creategateway",
+      "com.oraclecloud.apigateway.deletegateway",
+      "com.oraclecloud.apigateway.updategateway",
     ]
   })
   actions {
