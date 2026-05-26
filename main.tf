@@ -1,10 +1,13 @@
-# Stream Security OCI integration - Resource Manager stack v1.3.0
+# Stream Security OCI integration - Resource Manager stack v1.4.0
 #
 # Onboarding ack: terraform_data + local-exec POST to acknowledge_url
 # (unchanged from v1.1.4).
 #
 # v1.2.0 added the ongoing audit-event pipeline (Events rule → ONS topic
 # → HTTPS subscription → events_url). v1.3.0 adds VCN Flow Logs.
+# v1.4.0 extends the events_rule with 15 more event types covering the
+# Phase 2 resource expansion (Block Volume, Load Balancer, NSG, OKE
+# Cluster, Object Storage Bucket).
 #
 # v1.3.0 flow logs pipeline:
 #   OCI Logging log group "stream-security-logs"
@@ -226,6 +229,26 @@ resource "oci_events_rule" "stream_security_audit_events" {
       "com.oraclecloud.identitycontrolplane.deletecompartment",
       "com.oraclecloud.identitycontrolplane.updatecompartment",
       "com.oraclecloud.identitycontrolplane.movecompartment",
+      # Phase 2: Block Volume (oci_block_volume)
+      "com.oraclecloud.blockstorageapi.createvolume",
+      "com.oraclecloud.blockstorageapi.deletevolume",
+      "com.oraclecloud.blockstorageapi.updatevolume",
+      # Phase 2: Load Balancer (oci_load_balancer)
+      "com.oraclecloud.loadbalancer.createloadbalancer",
+      "com.oraclecloud.loadbalancer.deleteloadbalancer",
+      "com.oraclecloud.loadbalancer.updateloadbalancer",
+      # Phase 2: Network Security Group (oci_nsg)
+      "com.oraclecloud.virtualnetwork.createnetworksecuritygroup",
+      "com.oraclecloud.virtualnetwork.deletenetworksecuritygroup",
+      "com.oraclecloud.virtualnetwork.updatenetworksecuritygroup",
+      # Phase 2: OKE Cluster (oci_oke_cluster)
+      "com.oraclecloud.containerengine.createcluster",
+      "com.oraclecloud.containerengine.deletecluster",
+      "com.oraclecloud.containerengine.updatecluster",
+      # Phase 2: Object Storage Bucket (oci_bucket)
+      "com.oraclecloud.objectstorage.createbucket",
+      "com.oraclecloud.objectstorage.deletebucket",
+      "com.oraclecloud.objectstorage.updatebucket",
     ]
   })
   actions {
